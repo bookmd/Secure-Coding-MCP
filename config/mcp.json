@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "secure-coding-tool": {
+      "command": "npx",
+      "args": ["secure-coding-mcp@1.0.0"]
+    }
+  }
+}

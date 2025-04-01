@@ -1,0 +1,49 @@
+{
+  "name": "secure-coding-mcp",
+  "version": "1.0.0",
+  "description": "MCP server providing secure coding guidelines for AI-generated code",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "secure-coding-mcp": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=12.17.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "echo \"No tests specified\" && exit 0",
+    "postinstall": "chmod +x ./src/index.js",
+    "verify": "node -e \"console.log('Secure Coding MCP package is properly installed')\""
+  },
+  "keywords": [
+    "mcp",
+    "secure-coding",
+    "security",
+    "guidelines",
+    "model-context-protocol",
+    "cursor",
+    "ai",
+    "code-generation"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.7.0"
+  },
+  "files": [
+    "src/index.js",
+    "README.md",
+    "config/mcp.json",
+    "examples/auth-with-MCP.js",
+    "examples/auth-without-mcp.js"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/secure-coding-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/secure-coding-mcp/issues"
+  },
+  "homepage": "https://github.com/yourusername/secure-coding-mcp#readme"
+} 
