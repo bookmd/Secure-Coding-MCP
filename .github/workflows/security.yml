@@ -1,0 +1,460 @@
+# Self-contained org-wide PR security scanner.
+# Copy to: .github/workflows/security.yml in any bookmd repo. No external engine repo required.
+#
+# Jobs: deps (OSV-Scanner) -> ai-scan (Claude on Bedrock, phases 1-4) -> report (scanner-stats ingest)
+# Secrets (org level): SCANNER_STATS_URL + SCANNER_STATS_TOKEN (stats, optional), SOCKET_API_TOKEN (optional)
+# Bedrock auth is GitHub OIDC -> IAM role; no API key secret needed.
+name: Security
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: read
+
+env:
+  AWS_REGION: us-east-1
+  BEDROCK_ROLE_ARN: arn:aws:iam::232282424912:role/bedrock-cicd-scanner
+  BEDROCK_MODEL_ARN: arn:aws:bedrock:us-east-1:232282424912:application-inference-profile/kaofehoxbka6
+  SCANNER_TAG: org-v2
+
+jobs:
+  deps:
+    name: Dependency scan (OSV)
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run OSV-Scanner
+        run: |
+          curl -sSL -o /usr/local/bin/osv-scanner \
+            https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --format json --recursive . > osv-results.json || true
+          jq -e . osv-results.json >/dev/null 2>&1 || echo '{"results":[]}' > osv-results.json
+          echo "OSV result groups: $(jq '.results | length' osv-results.json)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osv-results
+          path: osv-results.json
+
+  ai-scan:
+    name: AI security scan (phases 1-4)
+    needs: deps
+    runs-on: ubuntu-latest
+    # Hard cap so a hung model call can never pin the check (and the PR) indefinitely.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: osv-results
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare scan workspace + Socket MCP config
+        env:
+          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}
+        run: |
+          mkdir -p .security-scan
+          mv osv-results.json .security-scan/osv-results.json
+          if [ -n "$SOCKET_API_TOKEN" ]; then
+            jq -n --arg t "$SOCKET_API_TOKEN" \
+              '{mcpServers:{socket:{type:"http",url:"https://mcp.socket.dev/",headers:{Authorization:("Bearer "+$t)}}}}' \
+              > .security-scan/mcp.json
+          else
+            echo '{"mcpServers":{"socket":{"type":"http","url":"https://mcp.socket.dev/"}}}' > .security-scan/mcp.json
+          fi
+
+      # The scan prompt is shared between attempt 1 and the retry — kept in a file to stay DRY.
+      - name: Write scan prompt
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p .security-scan
+          cat > .security-scan/prompt.txt <<'PROMPT'
+          You are the bookmd PR security scanner. Repo: __REPO__, PR #$PR_NUMBER,
+          head $HEAD_SHA, base branch $BASE_REF. Analyze ONLY risk introduced or made reachable by this PR
+          (get the diff with: git diff origin/$BASE_REF...HEAD).
+
+          Run four phases:
+          1. **pr-review** — line-level vulnerabilities in the diff: injection (SQL/NoSQL/command/template),
+             XSS, path traversal, SSRF, insecure deserialization, hardcoded secrets, weak crypto,
+             missing authn/authz, unsafe redirects, prototype pollution.
+          2. **architecture** — trust-boundary and design issues: new endpoints without guards, broadened
+             permissions, disabled validation, unsafe defaults, CORS/CSP regressions.
+          3. **taint** — source-to-sink: trace user-controlled input across the changed files to dangerous
+             sinks (queries, exec, fs, network, eval, innerHTML). Follow calls into unchanged files when needed.
+          4. **deps** — read `.security-scan/osv-results.json`. For each vulnerable or newly added package,
+             use the Socket MCP `depscore` tool when available. Judge REACHABILITY from this codebase:
+             action=BLOCK only if vulnerable AND likely reachable; WARN if vulnerable but unproven
+             reachability or depscore < 0.5; otherwise INFO.
+
+          Severity rubric: critical = exploitable now with material impact; high = exploitable with
+          preconditions; medium = defense-in-depth gap; low = hardening; info = note.
+
+          REQUIRED OUTPUT 1 — write the file `.security-scan/findings.json` exactly in this shape
+          (valid JSON, no trailing commas; omit unknown optional fields):
+          {
+            "phases_completed": ["pr-review","architecture","taint","deps"],
+            "findings": [
+              {"phase":"pr-review|architecture|taint","rule":"kebab-case-rule-id",
+               "severity":"critical|high|medium|low|info","confidence":"high|medium|low",
+               "title":"one line","description":"what/why","recommendation":"fix",
+               "file_path":"path/from/repo/root.ts","line_start":1,"line_end":2,
+               "cwe":"CWE-89","posted_inline":false}
+            ],
+            "dependency_findings": [
+              {"package":"name","version":"1.2.3","ecosystem":"npm","osv_ids":["GHSA-..."],
+               "advisory_severity":"critical|high|medium|low|info","socket_depscore":0.42,
+               "reachable":true,"action":"WARN|BLOCK|INFO"}
+            ]
+          }
+          Report ALL findings in the file, even info-level. `phases_completed` MUST list every phase you
+          actually ran — the gate treats a missing phase as "scan did not complete". Only write the file
+          once you have genuinely completed pr-review, architecture, and taint.
+
+          REQUIRED OUTPUT 2 — sticky PR summary comment. Write a markdown body to the file
+          `.security-scan/summary.md` that starts with the line `<!-- security-scanner-results:v1 -->`
+          then `## Security Scanner Results`, a severity-count table, and one bullet per finding
+          (severity emoji, title, `file:line`). Then upsert it EXACTLY like this — note the capital
+          `-F body=@` which reads the file (lowercase -f would post the literal string):
+            existing=$(gh api repos/__REPO__/issues/$PR_NUMBER/comments --paginate \
+              --jq '.[] | select(.body | contains("security-scanner-results:v1")) | .id' | head -1)
+            if [ -n "$existing" ]; then
+              gh api -X PATCH repos/__REPO__/issues/comments/$existing -F body=@.security-scan/summary.md
+            else
+              gh api repos/__REPO__/issues/$PR_NUMBER/comments -F body=@.security-scan/summary.md
+            fi
+          Afterwards verify: re-fetch the comment and confirm its body starts with the marker, not with "@".
+
+          REQUIRED OUTPUT 3 — for each CRITICAL finding with a file/line in the diff, post an inline comment
+          and set its `posted_inline` to true in findings.json:
+            gh api repos/__REPO__/pulls/$PR_NUMBER/comments \
+              -f body="🔴 **<title>** — <recommendation>" -f commit_id=$HEAD_SHA \
+              -f path=<file_path> -F line=<line_start> -f side=RIGHT
+
+          Do not try to make the job pass or fail yourself — just write findings.json and post the
+          comments. The "Security gate" step reads findings.json and decides whether to block.
+          PROMPT
+          sed -i "s|__REPO__|${REPO}|g" .security-scan/prompt.txt
+          # Expose the prompt to both scan attempts as a multiline env var (DRY).
+          {
+            echo "SCAN_PROMPT<<SCAN_PROMPT_EOF"
+            cat .security-scan/prompt.txt
+            echo "SCAN_PROMPT_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Claude security scan (attempt 1)
+        id: scan1
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        with:
+          # explicit token skips the Claude GitHub App token exchange (which requires
+          # the workflow file to exist identically on the default branch)
+          github_token: ${{ github.token }}
+          use_bedrock: "true"
+          claude_args: |
+            --model ${{ env.BEDROCK_MODEL_ARN }}
+            --mcp-config .security-scan/mcp.json
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh api:*),Bash(gh pr view:*),mcp__socket__depscore"
+          prompt: ${{ env.SCAN_PROMPT }}
+
+      # Retry once on a transient model/runtime failure (the ~2% is_error class we observed),
+      # but only if attempt 1 did not already produce a complete findings.json.
+      - name: Check attempt 1 output
+        id: check1
+        if: always()
+        run: |
+          if jq -e '[("pr-review","architecture","taint") as $p | ([.phases_completed[]?] | index($p))] | all(. != null)' \
+               .security-scan/findings.json >/dev/null 2>&1; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Claude security scan (attempt 2 — retry)
+        id: scan2
+        if: steps.check1.outputs.complete != 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        with:
+          github_token: ${{ github.token }}
+          use_bedrock: "true"
+          claude_args: |
+            --model ${{ env.BEDROCK_MODEL_ARN }}
+            --mcp-config .security-scan/mcp.json
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh api:*),Bash(gh pr view:*),mcp__socket__depscore"
+          prompt: ${{ env.SCAN_PROMPT }}
+
+      - name: Validate scan output
+        id: validate
+        if: always()
+        run: |
+          F=.security-scan/findings.json
+          scan_ok=true; reason=""
+          if [ ! -f "$F" ]; then
+            scan_ok=false; reason="no findings.json written"
+          elif ! jq -e . "$F" >/dev/null 2>&1; then
+            scan_ok=false; reason="findings.json is not valid JSON"
+          else
+            missing=$(jq -r '(["pr-review","architecture","taint"] - [.phases_completed[]?]) | join(", ")' "$F" 2>/dev/null || echo "all")
+            if [ -n "$missing" ]; then scan_ok=false; reason="phases did not complete: ${missing}"; fi
+          fi
+          echo "scan_ok=$scan_ok" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "scan_ok=$scan_ok ${reason:+($reason)}"
+
+      - name: Ensure findings file exists
+        if: always()
+        run: |
+          mkdir -p .security-scan
+          [ -f .security-scan/findings.json ] || \
+            echo '{"phases_completed":[],"findings":[],"dependency_findings":[]}' > .security-scan/findings.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-findings
+          path: .security-scan/findings.json
+
+      # Single required check with deterministic semantics. Runs even if the model steps errored
+      # (they are continue-on-error), so the gate — not an infra hiccup — owns the verdict.
+      - name: Security gate
+        if: always()
+        env:
+          # Block when a finding at or above this severity is present.
+          # One of: critical | high | medium | low | none. 'none' = advisory only.
+          BLOCK_ON_SEVERITY: none
+          SCAN_OK: ${{ steps.validate.outputs.scan_ok }}
+          SCAN_REASON: ${{ steps.validate.outputs.reason }}
+        run: |
+          set -uo pipefail
+          F=.security-scan/findings.json
+
+          if [ "${BLOCK_ON_SEVERITY}" = "none" ]; then
+            echo "Security gate disabled (BLOCK_ON_SEVERITY=none) — advisory only."
+            exit 0
+          fi
+
+          # Distinguish "scan could not complete" (transient: retry) from a real security verdict.
+          # This is NOT a silent pass (closes the empty-findings false negative) and NOT a security
+          # block — it tells the developer to re-run, and fails closed only after the in-run retry.
+          if [ "${SCAN_OK}" != "true" ]; then
+            echo "::error title=Security Gate::Scan did not complete (${SCAN_REASON:-unknown}). This is a scanner/infra issue, not a security finding — re-run this job. Failing closed until a clean scan is recorded."
+            exit 1
+          fi
+
+          case "${BLOCK_ON_SEVERITY}" in
+            info) threshold=0 ;; low) threshold=1 ;; medium) threshold=2 ;;
+            high) threshold=3 ;; critical) threshold=4 ;; *) threshold=4 ;;
+          esac
+
+          blocking=$(jq --argjson t "$threshold" '
+            [ .findings[]? | (.severity|ascii_downcase) as $s
+              | ({info:0,low:1,medium:2,high:3,critical:4}[$s] // 0)
+              | select(. >= $t) ] | length' "$F")
+          depblock=$(jq '[ .dependency_findings[]? | select(.action=="BLOCK") ] | length' "$F")
+
+          echo "Findings at or above '${BLOCK_ON_SEVERITY}': ${blocking}"
+          echo "Dependency findings marked BLOCK: ${depblock}"
+
+          if [ "${blocking}" -gt 0 ] || [ "${depblock}" -gt 0 ]; then
+            echo "::error title=Security Gate::BLOCKED — ${blocking} finding(s) at/above ${BLOCK_ON_SEVERITY} and ${depblock} dependency BLOCK(s). See the 'Security Scanner Results' PR comment for details."
+            exit 1
+          fi
+          echo "Security gate passed — scan completed cleanly, no findings at or above '${BLOCK_ON_SEVERITY}'."
+
+  report:
+    name: Report to scanner-stats
+    needs: [deps, ai-scan]
+    if: always() && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Emit scan statistics
+        # advisory reporter — never let it fail the workflow, even on an unexpected error
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          SCANNER_STATS_URL: ${{ secrets.SCANNER_STATS_URL }}
+          SCANNER_STATS_TOKEN: ${{ secrets.SCANNER_STATS_TOKEN }}
+          WORKFLOW_VARIANT: org
+          SCANNER_TAG: ${{ env.SCANNER_TAG }}
+          MODEL_ARN: ${{ env.BEDROCK_MODEL_ARN }}
+          SCAN_RUNNER: ubuntu-latest
+          AI_SCAN_RESULT: ${{ needs.ai-scan.result }}
+        with:
+          script: |
+            const url = (process.env.SCANNER_STATS_URL || '').replace(/\/+$/, '');
+            const token = process.env.SCANNER_STATS_TOKEN || '';
+            if (!url || !token) { core.warning('SCANNER_STATS_URL / SCANNER_STATS_TOKEN not set; skipping stats report'); return; }
+
+            const fs = require('fs');
+            const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            let run = null;
+            try { run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: context.runId })).data; } catch {}
+
+            const scanOut = readJson('artifacts/findings.json') || {};
+            const osv = readJson('artifacts/osv-results.json');
+
+            const SEVS = ['critical', 'high', 'medium', 'low', 'info'];
+            const norm = (s, dflt = 'medium') => {
+              s = String(s || '').toLowerCase();
+              if (s === 'moderate') s = 'medium';
+              return SEVS.includes(s) ? s : dflt;
+            };
+            const PHASES = ['pr-review', 'architecture', 'taint'];
+
+            const findings = (Array.isArray(scanOut.findings) ? scanOut.findings : [])
+              .filter((f) => f && f.title)
+              .map((f) => ({
+                phase: PHASES.includes(f.phase) ? f.phase : 'pr-review',
+                category: f.category ?? undefined,
+                rule: f.rule ?? undefined,
+                severity: norm(f.severity),
+                confidence: f.confidence ?? undefined,
+                title: String(f.title).slice(0, 500),
+                description: f.description ?? undefined,
+                recommendation: f.recommendation ?? undefined,
+                file_path: f.file_path ?? undefined,
+                line_start: Number.isInteger(f.line_start) ? f.line_start : undefined,
+                line_end: Number.isInteger(f.line_end) ? f.line_end : undefined,
+                cwe: f.cwe ?? undefined,
+                posted_inline: Boolean(f.posted_inline),
+              }));
+
+            let deps = (Array.isArray(scanOut.dependency_findings) ? scanOut.dependency_findings : [])
+              .filter((d) => d && d.package)
+              .map((d) => ({
+                package: String(d.package),
+                version: d.version ?? undefined,
+                ecosystem: d.ecosystem ?? 'npm',
+                osv_ids: Array.isArray(d.osv_ids) ? d.osv_ids.map(String) : [],
+                advisory_severity: d.advisory_severity ? norm(d.advisory_severity) : undefined,
+                socket_depscore: typeof d.socket_depscore === 'number' ? d.socket_depscore : undefined,
+                reachable: typeof d.reachable === 'boolean' ? d.reachable : undefined,
+                action: ['WARN', 'BLOCK', 'INFO'].includes(d.action) ? d.action : 'INFO',
+              }));
+
+            // Fallback: if the AI phase produced no dependency findings, map raw OSV results.
+            if (deps.length === 0 && osv && Array.isArray(osv.results)) {
+              for (const result of osv.results) {
+                for (const p of result.packages ?? []) {
+                  const pkg = p.package ?? {};
+                  const vulns = p.vulnerabilities ?? [];
+                  if (!pkg.name || vulns.length === 0) continue;
+                  const sev = norm(vulns.map((v) => v.database_specific?.severity).find(Boolean), 'medium');
+                  deps.push({
+                    package: pkg.name,
+                    version: pkg.version,
+                    ecosystem: String(pkg.ecosystem || 'npm').toLowerCase(),
+                    osv_ids: vulns.map((v) => v.id).filter(Boolean),
+                    advisory_severity: sev,
+                    action: sev === 'critical' || sev === 'high' ? 'WARN' : 'INFO',
+                  });
+                }
+              }
+            }
+
+            const resultMap = { success: 'success', failure: 'failure' };
+            const payload = {
+              schema_version: 1,
+              scan: {
+                repo: `${owner}/${repo}`,
+                workflow_variant: process.env.WORKFLOW_VARIANT,
+                workflow_run_id: context.runId,
+                run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT || 1),
+                workflow_run_url: run?.html_url ?? `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`,
+                pr_number: pr?.number,
+                pr_title: pr?.title,
+                pr_author: pr?.user?.login,
+                branch: pr?.head?.ref,
+                base_sha: pr?.base?.sha,
+                head_sha: pr?.head?.sha,
+                trigger_event: context.eventName,
+                scanner_tag: process.env.SCANNER_TAG,
+                model: process.env.MODEL_ARN,
+                runner: process.env.SCAN_RUNNER,
+                ci_wait_seconds: process.env.CI_WAIT_SECONDS ? Number(process.env.CI_WAIT_SECONDS) : undefined,
+                started_at: run?.run_started_at ?? undefined,
+                finished_at: new Date().toISOString(),
+                status: resultMap[process.env.AI_SCAN_RESULT] ?? 'partial',
+                phases_completed: Array.isArray(scanOut.phases_completed) ? scanOut.phases_completed : [],
+              },
+              findings,
+              dependency_findings: deps,
+            };
+
+            // Reporting is best-effort: an unreachable/slow/erroring stats server must NEVER
+            // fail this advisory job. Bounded timeout + a couple of retries, then give up with a warning.
+            const body = JSON.stringify(payload);
+            const TIMEOUT_MS = 10000;
+            const ATTEMPTS = 3;
+            let reported = false;
+            for (let attempt = 1; attempt <= ATTEMPTS && !reported; attempt++) {
+              try {
+                const res = await fetch(`${url}/api/v1/ingest/scan`, {
+                  method: 'POST',
+                  headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+                  body,
+                  signal: AbortSignal.timeout(TIMEOUT_MS),
+                });
+                const text = await res.text().catch(() => '');
+                if (res.ok) {
+                  let id = 'ok';
+                  try { id = JSON.parse(text).scan_run_id ?? 'ok'; } catch {}
+                  core.notice(`scanner-stats: recorded scan ${id}`);
+                  reported = true;
+                } else if (res.status === 401 || res.status === 422) {
+                  // client errors won't fix themselves on retry — stop early
+                  core.warning(`scanner-stats ingest rejected: HTTP ${res.status} ${text.slice(0, 300)}`);
+                  break;
+                } else {
+                  core.warning(`scanner-stats ingest attempt ${attempt}/${ATTEMPTS} failed: HTTP ${res.status}`);
+                }
+              } catch (err) {
+                const reason = err && err.name === 'TimeoutError'
+                  ? `timed out after ${TIMEOUT_MS}ms`
+                  : (err && err.message) || String(err);
+                core.warning(`scanner-stats ingest attempt ${attempt}/${ATTEMPTS} could not reach server: ${reason}`);
+              }
+              if (!reported && attempt < ATTEMPTS) await new Promise((r) => setTimeout(r, 2000 * attempt));
+            }
+            if (!reported) {
+              core.warning('scanner-stats: giving up after retries; scan results were not recorded (workflow still succeeds — reporting is advisory)');
+            }
