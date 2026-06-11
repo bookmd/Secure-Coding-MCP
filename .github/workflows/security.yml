@@ -53,6 +53,8 @@ jobs:
     name: AI security scan (phases 1-4)
     needs: deps
     runs-on: ubuntu-latest
+    # Hard cap so a hung model call can never pin the check (and the PR) indefinitely.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -81,7 +83,88 @@ jobs:
             echo '{"mcpServers":{"socket":{"type":"http","url":"https://mcp.socket.dev/"}}}' > .security-scan/mcp.json
           fi
 
-      - name: Claude security scan
+      # The scan prompt is shared between attempt 1 and the retry — kept in a file to stay DRY.
+      - name: Write scan prompt
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p .security-scan
+          cat > .security-scan/prompt.txt <<'PROMPT'
+          You are the bookmd PR security scanner. Repo: __REPO__, PR #$PR_NUMBER,
+          head $HEAD_SHA, base branch $BASE_REF. Analyze ONLY risk introduced or made reachable by this PR
+          (get the diff with: git diff origin/$BASE_REF...HEAD).
+
+          Run four phases:
+          1. **pr-review** — line-level vulnerabilities in the diff: injection (SQL/NoSQL/command/template),
+             XSS, path traversal, SSRF, insecure deserialization, hardcoded secrets, weak crypto,
+             missing authn/authz, unsafe redirects, prototype pollution.
+          2. **architecture** — trust-boundary and design issues: new endpoints without guards, broadened
+             permissions, disabled validation, unsafe defaults, CORS/CSP regressions.
+          3. **taint** — source-to-sink: trace user-controlled input across the changed files to dangerous
+             sinks (queries, exec, fs, network, eval, innerHTML). Follow calls into unchanged files when needed.
+          4. **deps** — read `.security-scan/osv-results.json`. For each vulnerable or newly added package,
+             use the Socket MCP `depscore` tool when available. Judge REACHABILITY from this codebase:
+             action=BLOCK only if vulnerable AND likely reachable; WARN if vulnerable but unproven
+             reachability or depscore < 0.5; otherwise INFO.
+
+          Severity rubric: critical = exploitable now with material impact; high = exploitable with
+          preconditions; medium = defense-in-depth gap; low = hardening; info = note.
+
+          REQUIRED OUTPUT 1 — write the file `.security-scan/findings.json` exactly in this shape
+          (valid JSON, no trailing commas; omit unknown optional fields):
+          {
+            "phases_completed": ["pr-review","architecture","taint","deps"],
+            "findings": [
+              {"phase":"pr-review|architecture|taint","rule":"kebab-case-rule-id",
+               "severity":"critical|high|medium|low|info","confidence":"high|medium|low",
+               "title":"one line","description":"what/why","recommendation":"fix",
+               "file_path":"path/from/repo/root.ts","line_start":1,"line_end":2,
+               "cwe":"CWE-89","posted_inline":false}
+            ],
+            "dependency_findings": [
+              {"package":"name","version":"1.2.3","ecosystem":"npm","osv_ids":["GHSA-..."],
+               "advisory_severity":"critical|high|medium|low|info","socket_depscore":0.42,
+               "reachable":true,"action":"WARN|BLOCK|INFO"}
+            ]
+          }
+          Report ALL findings in the file, even info-level. `phases_completed` MUST list every phase you
+          actually ran — the gate treats a missing phase as "scan did not complete". Only write the file
+          once you have genuinely completed pr-review, architecture, and taint.
+
+          REQUIRED OUTPUT 2 — sticky PR summary comment. Write a markdown body to the file
+          `.security-scan/summary.md` that starts with the line `<!-- security-scanner-results:v1 -->`
+          then `## Security Scanner Results`, a severity-count table, and one bullet per finding
+          (severity emoji, title, `file:line`). Then upsert it EXACTLY like this — note the capital
+          `-F body=@` which reads the file (lowercase -f would post the literal string):
+            existing=$(gh api repos/__REPO__/issues/$PR_NUMBER/comments --paginate \
+              --jq '.[] | select(.body | contains("security-scanner-results:v1")) | .id' | head -1)
+            if [ -n "$existing" ]; then
+              gh api -X PATCH repos/__REPO__/issues/comments/$existing -F body=@.security-scan/summary.md
+            else
+              gh api repos/__REPO__/issues/$PR_NUMBER/comments -F body=@.security-scan/summary.md
+            fi
+          Afterwards verify: re-fetch the comment and confirm its body starts with the marker, not with "@".
+
+          REQUIRED OUTPUT 3 — for each CRITICAL finding with a file/line in the diff, post an inline comment
+          and set its `posted_inline` to true in findings.json:
+            gh api repos/__REPO__/pulls/$PR_NUMBER/comments \
+              -f body="🔴 **<title>** — <recommendation>" -f commit_id=$HEAD_SHA \
+              -f path=<file_path> -F line=<line_start> -f side=RIGHT
+
+          Do not try to make the job pass or fail yourself — just write findings.json and post the
+          comments. The "Security gate" step reads findings.json and decides whether to block.
+          PROMPT
+          sed -i "s|__REPO__|${REPO}|g" .security-scan/prompt.txt
+          # Expose the prompt to both scan attempts as a multiline env var (DRY).
+          {
+            echo "SCAN_PROMPT<<SCAN_PROMPT_EOF"
+            cat .security-scan/prompt.txt
+            echo "SCAN_PROMPT_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Claude security scan (attempt 1)
+        id: scan1
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         env:
           GH_TOKEN: ${{ github.token }}
@@ -97,70 +180,57 @@ jobs:
             --model ${{ env.BEDROCK_MODEL_ARN }}
             --mcp-config .security-scan/mcp.json
             --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh api:*),Bash(gh pr view:*),mcp__socket__depscore"
-          prompt: |
-            You are the bookmd PR security scanner. Repo: ${{ github.repository }}, PR #$PR_NUMBER,
-            head $HEAD_SHA, base branch $BASE_REF. Analyze ONLY risk introduced or made reachable by this PR
-            (get the diff with: git diff origin/$BASE_REF...HEAD).
+          prompt: ${{ env.SCAN_PROMPT }}
 
-            Run four phases:
-            1. **pr-review** — line-level vulnerabilities in the diff: injection (SQL/NoSQL/command/template),
-               XSS, path traversal, SSRF, insecure deserialization, hardcoded secrets, weak crypto,
-               missing authn/authz, unsafe redirects, prototype pollution.
-            2. **architecture** — trust-boundary and design issues: new endpoints without guards, broadened
-               permissions, disabled validation, unsafe defaults, CORS/CSP regressions.
-            3. **taint** — source-to-sink: trace user-controlled input across the changed files to dangerous
-               sinks (queries, exec, fs, network, eval, innerHTML). Follow calls into unchanged files when needed.
-            4. **deps** — read `.security-scan/osv-results.json`. For each vulnerable or newly added package,
-               use the Socket MCP `depscore` tool when available. Judge REACHABILITY from this codebase:
-               action=BLOCK only if vulnerable AND likely reachable; WARN if vulnerable but unproven
-               reachability or depscore < 0.5; otherwise INFO.
+      # Retry once on a transient model/runtime failure (the ~2% is_error class we observed),
+      # but only if attempt 1 did not already produce a complete findings.json.
+      - name: Check attempt 1 output
+        id: check1
+        if: always()
+        run: |
+          if jq -e '[("pr-review","architecture","taint") as $p | ([.phases_completed[]?] | index($p))] | all(. != null)' \
+               .security-scan/findings.json >/dev/null 2>&1; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
 
-            Severity rubric: critical = exploitable now with material impact; high = exploitable with
-            preconditions; medium = defense-in-depth gap; low = hardening; info = note.
+      - name: Claude security scan (attempt 2 — retry)
+        id: scan2
+        if: steps.check1.outputs.complete != 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        with:
+          github_token: ${{ github.token }}
+          use_bedrock: "true"
+          claude_args: |
+            --model ${{ env.BEDROCK_MODEL_ARN }}
+            --mcp-config .security-scan/mcp.json
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh api:*),Bash(gh pr view:*),mcp__socket__depscore"
+          prompt: ${{ env.SCAN_PROMPT }}
 
-            REQUIRED OUTPUT 1 — write the file `.security-scan/findings.json` exactly in this shape
-            (valid JSON, no trailing commas; omit unknown optional fields):
-            {
-              "phases_completed": ["pr-review","architecture","taint","deps"],
-              "findings": [
-                {"phase":"pr-review|architecture|taint","rule":"kebab-case-rule-id",
-                 "severity":"critical|high|medium|low|info","confidence":"high|medium|low",
-                 "title":"one line","description":"what/why","recommendation":"fix",
-                 "file_path":"path/from/repo/root.ts","line_start":1,"line_end":2,
-                 "cwe":"CWE-89","posted_inline":false}
-              ],
-              "dependency_findings": [
-                {"package":"name","version":"1.2.3","ecosystem":"npm","osv_ids":["GHSA-..."],
-                 "advisory_severity":"critical|high|medium|low|info","socket_depscore":0.42,
-                 "reachable":true,"action":"WARN|BLOCK|INFO"}
-              ]
-            }
-            Report ALL findings in the file, even info-level. If a phase finds nothing, still list it in
-            phases_completed.
-
-            REQUIRED OUTPUT 2 — sticky PR summary comment. Write a markdown body to the file
-            `.security-scan/summary.md` that starts with the line `<!-- security-scanner-results:v1 -->`
-            then `## Security Scanner Results`, a severity-count table, and one bullet per finding
-            (severity emoji, title, `file:line`). Then upsert it EXACTLY like this — note the capital
-            `-F body=@` which reads the file (lowercase -f would post the literal string):
-              existing=$(gh api repos/${{ github.repository }}/issues/$PR_NUMBER/comments --paginate \
-                --jq '.[] | select(.body | contains("security-scanner-results:v1")) | .id' | head -1)
-              if [ -n "$existing" ]; then
-                gh api -X PATCH repos/${{ github.repository }}/issues/comments/$existing -F body=@.security-scan/summary.md
-              else
-                gh api repos/${{ github.repository }}/issues/$PR_NUMBER/comments -F body=@.security-scan/summary.md
-              fi
-            Afterwards verify: re-fetch the comment and confirm its body starts with the marker, not with "@".
-
-            REQUIRED OUTPUT 3 — for each CRITICAL finding with a file/line in the diff, post an inline comment
-            and set its `posted_inline` to true in findings.json:
-              gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/comments \
-                -f body="🔴 **<title>** — <recommendation>" -f commit_id=$HEAD_SHA \
-                -f path=<file_path> -F line=<line_start> -f side=RIGHT
-
-            Do not try to make the job pass or fail yourself — just write findings.json and post the
-            comments. The final "Security gate" step in this job reads findings.json and decides
-            whether to block the check.
+      - name: Validate scan output
+        id: validate
+        if: always()
+        run: |
+          F=.security-scan/findings.json
+          scan_ok=true; reason=""
+          if [ ! -f "$F" ]; then
+            scan_ok=false; reason="no findings.json written"
+          elif ! jq -e . "$F" >/dev/null 2>&1; then
+            scan_ok=false; reason="findings.json is not valid JSON"
+          else
+            missing=$(jq -r '(["pr-review","architecture","taint"] - [.phases_completed[]?]) | join(", ")' "$F" 2>/dev/null || echo "all")
+            if [ -n "$missing" ]; then scan_ok=false; reason="phases did not complete: ${missing}"; fi
+          fi
+          echo "scan_ok=$scan_ok" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "scan_ok=$scan_ok ${reason:+($reason)}"
 
       - name: Ensure findings file exists
         if: always()
@@ -175,23 +245,30 @@ jobs:
           name: scan-findings
           path: .security-scan/findings.json
 
-      # Blocking gate, in-job: this is the last step, so the artifact above always uploads first,
-      # and a failed scan step (Claude error) skips this step and leaves the job red — fail closed.
+      # Single required check with deterministic semantics. Runs even if the model steps errored
+      # (they are continue-on-error), so the gate — not an infra hiccup — owns the verdict.
       - name: Security gate
+        if: always()
         env:
           # Block when a finding at or above this severity is present.
           # One of: critical | high | medium | low | none. 'none' = advisory only.
           BLOCK_ON_SEVERITY: none
+          SCAN_OK: ${{ steps.validate.outputs.scan_ok }}
+          SCAN_REASON: ${{ steps.validate.outputs.reason }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           F=.security-scan/findings.json
 
           if [ "${BLOCK_ON_SEVERITY}" = "none" ]; then
             echo "Security gate disabled (BLOCK_ON_SEVERITY=none) — advisory only."
             exit 0
           fi
-          if [ ! -f "$F" ]; then
-            echo "::error title=Security Gate::No findings.json produced by the scan. Failing closed."
+
+          # Distinguish "scan could not complete" (transient: retry) from a real security verdict.
+          # This is NOT a silent pass (closes the empty-findings false negative) and NOT a security
+          # block — it tells the developer to re-run, and fails closed only after the in-run retry.
+          if [ "${SCAN_OK}" != "true" ]; then
+            echo "::error title=Security Gate::Scan did not complete (${SCAN_REASON:-unknown}). This is a scanner/infra issue, not a security finding — re-run this job. Failing closed until a clean scan is recorded."
             exit 1
           fi
 
@@ -213,7 +290,7 @@ jobs:
             echo "::error title=Security Gate::BLOCKED — ${blocking} finding(s) at/above ${BLOCK_ON_SEVERITY} and ${depblock} dependency BLOCK(s). See the 'Security Scanner Results' PR comment for details."
             exit 1
           fi
-          echo "Security gate passed — no findings at or above '${BLOCK_ON_SEVERITY}'."
+          echo "Security gate passed — scan completed cleanly, no findings at or above '${BLOCK_ON_SEVERITY}'."
 
   report:
     name: Report to scanner-stats
