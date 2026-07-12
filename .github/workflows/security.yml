@@ -131,28 +131,13 @@ jobs:
           actually ran — the gate treats a missing phase as "scan did not complete". Only write the file
           once you have genuinely completed pr-review, architecture, and taint.
 
-          REQUIRED OUTPUT 2 — sticky PR summary comment. Write a markdown body to the file
-          `.security-scan/summary.md` that starts with the line `<!-- security-scanner-results:v1 -->`
-          then `## Security Scanner Results`, a severity-count table, and one bullet per finding
-          (severity emoji, title, `file:line`). Then upsert it EXACTLY like this — note the capital
-          `-F body=@` which reads the file (lowercase -f would post the literal string):
-            existing=$(gh api repos/__REPO__/issues/$PR_NUMBER/comments --paginate \
-              --jq '.[] | select(.body | contains("security-scanner-results:v1")) | .id' | head -1)
-            if [ -n "$existing" ]; then
-              gh api -X PATCH repos/__REPO__/issues/comments/$existing -F body=@.security-scan/summary.md
-            else
-              gh api repos/__REPO__/issues/$PR_NUMBER/comments -F body=@.security-scan/summary.md
-            fi
-          Afterwards verify: re-fetch the comment and confirm its body starts with the marker, not with "@".
-
-          REQUIRED OUTPUT 3 — for each CRITICAL finding with a file/line in the diff, post an inline comment
-          and set its `posted_inline` to true in findings.json:
-            gh api repos/__REPO__/pulls/$PR_NUMBER/comments \
-              -f body="🔴 **<title>** — <recommendation>" -f commit_id=$HEAD_SHA \
-              -f path=<file_path> -F line=<line_start> -f side=RIGHT
-
-          Do not try to make the job pass or fail yourself — just write findings.json and post the
-          comments. The "Security gate" step reads findings.json and decides whether to block.
+          Do NOT post any PR comments and do NOT try to make the job pass or fail. Deterministic
+          workflow steps own everything downstream: they render findings.json into the sticky PR
+          summary comment (severity table + every finding with its file:line and remediation) and
+          into inline comments on each critical finding, and the "Security gate" step reads
+          findings.json and decides whether to block. Your ONLY job is to write an accurate,
+          complete findings.json — include `recommendation` on every finding, because that text is
+          what the developer sees as the remediation.
           PROMPT
           sed -i "s|__REPO__|${REPO}|g" .security-scan/prompt.txt
           # Expose the prompt to both scan attempts as a multiline env var (DRY).
@@ -179,7 +164,7 @@ jobs:
           claude_args: |
             --model ${{ env.BEDROCK_MODEL_ARN }}
             --mcp-config .security-scan/mcp.json
-            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh api:*),Bash(gh pr view:*),mcp__socket__depscore"
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh pr view:*),mcp__socket__depscore"
           prompt: ${{ env.SCAN_PROMPT }}
 
       # Retry once on a transient model/runtime failure (the ~2% is_error class we observed),
@@ -211,7 +196,7 @@ jobs:
           claude_args: |
             --model ${{ env.BEDROCK_MODEL_ARN }}
             --mcp-config .security-scan/mcp.json
-            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh api:*),Bash(gh pr view:*),mcp__socket__depscore"
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh pr view:*),mcp__socket__depscore"
           prompt: ${{ env.SCAN_PROMPT }}
 
       - name: Validate scan output
@@ -239,6 +224,129 @@ jobs:
           [ -f .security-scan/findings.json ] || \
             echo '{"phases_completed":[],"findings":[],"dependency_findings":[]}' > .security-scan/findings.json
 
+      # Deterministic sticky summary comment rendered from findings.json (NOT model-posted),
+      # so a completed scan always explains its findings + remediation on the PR. continue-on-error
+      # keeps a comment/API hiccup from failing the required check — the gate owns the verdict.
+      - name: Post findings summary comment
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BLOCK_ON_SEVERITY: critical
+          SCAN_OK: ${{ steps.validate.outputs.scan_ok }}
+          SCAN_REASON: ${{ steps.validate.outputs.reason }}
+        run: |
+          set -uo pipefail
+          F=.security-scan/findings.json
+          M=.security-scan/summary.md
+          emoji() { case "$1" in
+            critical) printf '🔴';; high) printf '🟠';; medium) printf '🟡';;
+            low) printf '🔵';; info) printf '⚪';; *) printf '⚪';; esac; }
+
+          crit=$(jq '[.findings[]?|select((.severity|ascii_downcase)=="critical")]|length' "$F")
+          high=$(jq '[.findings[]?|select((.severity|ascii_downcase)=="high")]|length' "$F")
+          med=$(jq  '[.findings[]?|select((.severity|ascii_downcase)=="medium")]|length' "$F")
+          low=$(jq  '[.findings[]?|select((.severity|ascii_downcase)=="low")]|length' "$F")
+          info=$(jq '[.findings[]?|select((.severity|ascii_downcase)=="info")]|length' "$F")
+          total=$(jq '[.findings[]?]|length' "$F")
+          depblock=$(jq '[.dependency_findings[]?|select(.action=="BLOCK")]|length' "$F")
+          depwarn=$(jq  '[.dependency_findings[]?|select(.action=="WARN")]|length' "$F")
+
+          {
+            echo "<!-- security-scanner-results:v1 -->"
+            echo "## Security Scanner Results"
+            echo
+            if [ "${SCAN_OK}" != "true" ]; then
+              echo "> ⚠️ **Scan did not complete** (${SCAN_REASON:-unknown}) — this is a scanner/infra issue, not a clean bill of health. Re-run the job."
+              echo
+            fi
+            echo "| Critical | High | Medium | Low | Info | Dep BLOCK | Dep WARN |"
+            echo "|---:|---:|---:|---:|---:|---:|---:|"
+            echo "| $crit | $high | $med | $low | $info | $depblock | $depwarn |"
+            echo
+            if [ "$total" -eq 0 ] && [ "$depblock" -eq 0 ] && [ "$depwarn" -eq 0 ]; then
+              echo "✅ No findings introduced by this PR."
+            else
+              echo "### Findings"
+              echo
+              jq -r '
+                def rank: {critical:4,high:3,medium:2,low:1,info:0}[(.severity|ascii_downcase)] // 0;
+                .findings // [] | sort_by(-rank) | .[]
+                | [ (.severity|ascii_downcase), .title,
+                    ((.file_path // "n/a") + (if .line_start then ":" + (.line_start|tostring) else "" end)),
+                    (.recommendation // "—") ] | @tsv
+              ' "$F" | while IFS=$'\t' read -r sev title loc rec; do
+                printf -- '- %s **%s** — `%s`\n' "$(emoji "$sev")" "$title" "$loc"
+                printf -- '  - _Remediation:_ %s\n' "$rec"
+              done
+              if [ "$depblock" -gt 0 ] || [ "$depwarn" -gt 0 ]; then
+                echo
+                echo "### Vulnerable dependencies"
+                jq -r '.dependency_findings // [] | map(select(.action=="BLOCK" or .action=="WARN")) | .[]
+                  | [ .action, (.package + "@" + (.version // "?")), ((.osv_ids // [])|join(", ")) ] | @tsv' "$F" \
+                  | while IFS=$'\t' read -r act pkg ids; do
+                      printf -- '- **%s** `%s` %s\n' "$act" "$pkg" "${ids:+($ids)}"
+                    done
+              fi
+            fi
+            echo
+            echo "_Gate blocks at severity **${BLOCK_ON_SEVERITY}** or a dependency marked BLOCK. Full history in scanner-stats._"
+          } > "$M"
+
+          existing=$(gh api repos/"$REPO"/issues/"$PR_NUMBER"/comments --paginate \
+            --jq '.[] | select(.body | contains("security-scanner-results:v1")) | .id' | head -1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH repos/"$REPO"/issues/comments/"$existing" -F body=@"$M" >/dev/null && echo "updated summary comment $existing"
+          else
+            gh api repos/"$REPO"/issues/"$PR_NUMBER"/comments -F body=@"$M" >/dev/null && echo "created summary comment"
+          fi
+
+      # Deterministic inline comments for critical findings (idempotent via a per-location marker),
+      # then mark those findings posted_inline=true so scanner-stats reflects it.
+      - name: Post inline comments for critical findings
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          F=.security-scan/findings.json
+          [ -f "$F" ] || exit 0
+          gh api repos/"$REPO"/pulls/"$PR_NUMBER"/comments --paginate --jq '.[].body' \
+            > .security-scan/existing-inline.txt 2>/dev/null || true
+
+          jq -r '
+            .findings // [] | to_entries[]
+            | .key as $i | .value
+            | select((.severity|ascii_downcase)=="critical" and .file_path and .line_start)
+            | [ ($i|tostring), .file_path, (.line_start|tostring), .title, (.recommendation // "See the summary comment.") ] | @tsv
+          ' "$F" > .security-scan/crit.tsv || true
+
+          posted=""
+          while IFS=$'\t' read -r idx path line title rec; do
+            [ -n "${path:-}" ] || continue
+            marker="<!-- ss-inline:${path}:${line} -->"
+            if grep -qF "$marker" .security-scan/existing-inline.txt 2>/dev/null; then
+              echo "inline exists, skip: $path:$line"; posted="$posted $idx"; continue
+            fi
+            body=$(printf '🔴 **%s**\n\n_Remediation:_ %s\n%s' "$title" "$rec" "$marker")
+            if gh api repos/"$REPO"/pulls/"$PR_NUMBER"/comments \
+                 -f body="$body" -f commit_id="$HEAD_SHA" -f path="$path" -F line="$line" -f side=RIGHT >/dev/null 2>&1; then
+              echo "posted inline: $path:$line"; posted="$posted $idx"
+            else
+              echo "::warning title=Inline comment::could not post inline comment for $path:$line (line may be outside the PR diff)"
+            fi
+          done < .security-scan/crit.tsv
+
+          for idx in $posted; do
+            jq --argjson i "$idx" '.findings[$i].posted_inline = true' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+          done
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -252,7 +360,7 @@ jobs:
         env:
           # Block when a finding at or above this severity is present.
           # One of: critical | high | medium | low | none. 'none' = advisory only.
-          BLOCK_ON_SEVERITY: none
+          BLOCK_ON_SEVERITY: critical
           SCAN_OK: ${{ steps.validate.outputs.scan_ok }}
           SCAN_REASON: ${{ steps.validate.outputs.reason }}
         run: |
