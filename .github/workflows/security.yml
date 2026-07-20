@@ -164,14 +164,23 @@ jobs:
           # the workflow file to exist identically on the default branch)
           github_token: ${{ github.token }}
           use_bedrock: "true"
+          # Scan bot-authored PRs too (gitops/renovate/dependabot). Without this the action
+          # silently skips any bot-triggered run and writes no findings.json -> gate fails
+          # closed. Safe here: private repos + a fixed scan prompt the bot cannot control.
+          allowed_bots: "*"
           claude_args: |
             --model ${{ env.BEDROCK_MODEL_ARN }}
             --mcp-config .security-scan/mcp.json
             --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh pr view:*),mcp__socket__depscore"
           prompt: ${{ env.SCAN_PROMPT }}
 
-      # Retry once on a transient model/runtime failure (the ~2% is_error class we observed),
-      # but only if attempt 1 did not already produce a complete findings.json.
+      # Two no-op failure modes make the action exit in seconds without running Claude, writing
+      # no findings.json, which fails the gate closed:
+      #   1. DETERMINISTIC — a bot-authored trigger (gitops/renovate/dependabot). Fixed by
+      #      `allowed_bots: "*"` on every attempt above/below; retries alone never help this one.
+      #   2. TRANSIENT — an occasional runtime no-op. Back-to-back retries hit the same window,
+      #      so attempts 2 and 3 are spaced with a back-off to let it self-heal.
+      # The happy path (attempt 1 completes) skips all of this.
       - name: Check attempt 1 output
         id: check1
         if: always()
@@ -182,6 +191,10 @@ jobs:
           else
             echo "complete=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Back-off before attempt 2
+        if: steps.check1.outputs.complete != 'true'
+        run: sleep 45
 
       - name: Claude security scan (attempt 2 — retry)
         id: scan2
@@ -197,6 +210,43 @@ jobs:
         with:
           github_token: ${{ github.token }}
           use_bedrock: "true"
+          allowed_bots: "*"
+          claude_args: |
+            --model ${{ env.BEDROCK_MODEL_ARN }}
+            --mcp-config .security-scan/mcp.json
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh pr view:*),mcp__socket__depscore"
+          prompt: ${{ env.SCAN_PROMPT }}
+
+      - name: Check attempt 2 output
+        id: check2
+        if: always()
+        run: |
+          if jq -e '[("pr-review","architecture","taint") as $p | ([.phases_completed[]?] | index($p))] | all(. != null)' \
+               .security-scan/findings.json >/dev/null 2>&1; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Back-off before attempt 3
+        if: steps.check2.outputs.complete != 'true'
+        run: sleep 90
+
+      - name: Claude security scan (attempt 3 — final retry)
+        id: scan3
+        if: steps.check2.outputs.complete != 'true'
+        continue-on-error: true
+        # Pinned — see the note on attempt 1 above (floating @v1 regressed on Bedrock+prompt).
+        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        with:
+          github_token: ${{ github.token }}
+          use_bedrock: "true"
+          allowed_bots: "*"
           claude_args: |
             --model ${{ env.BEDROCK_MODEL_ARN }}
             --mcp-config .security-scan/mcp.json
