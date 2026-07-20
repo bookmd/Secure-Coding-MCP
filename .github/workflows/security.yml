@@ -150,7 +150,10 @@ jobs:
       - name: Claude security scan (attempt 1)
         id: scan1
         continue-on-error: true
-        uses: anthropics/claude-code-action@v1
+        # Pinned to the last known-good release. The floating @v1 tag regressed in v1.0.175+:
+        # on Bedrock with a direct `prompt` the action no-ops after the trigger check (never
+        # installs/runs Claude Code, writes no findings.json), which fails the gate closed.
+        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -184,7 +187,8 @@ jobs:
         id: scan2
         if: steps.check1.outputs.complete != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-action@v1
+        # Pinned — see the note on attempt 1 above (floating @v1 regressed on Bedrock+prompt).
+        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
