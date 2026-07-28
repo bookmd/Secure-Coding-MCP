@@ -288,7 +288,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BLOCK_ON_SEVERITY: critical
+          BLOCK_ON_SEVERITY: high
           SCAN_OK: ${{ steps.validate.outputs.scan_ok }}
           SCAN_REASON: ${{ steps.validate.outputs.reason }}
         run: |
@@ -414,7 +414,7 @@ jobs:
         env:
           # Block when a finding at or above this severity is present.
           # One of: critical | high | medium | low | none. 'none' = advisory only.
-          BLOCK_ON_SEVERITY: critical
+          BLOCK_ON_SEVERITY: high
           SCAN_OK: ${{ steps.validate.outputs.scan_ok }}
           SCAN_REASON: ${{ steps.validate.outputs.reason }}
         run: |
