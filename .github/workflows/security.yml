@@ -8,7 +8,9 @@ name: Security
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # Pushes are debounced before scanning so the required verdict still covers the
+    # latest head without paying for every commit in a burst.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 concurrency:
   group: security-scan-${{ github.event.pull_request.number }}
@@ -24,15 +26,24 @@ permissions:
 env:
   AWS_REGION: us-east-1
   BEDROCK_ROLE_ARN: arn:aws:iam::232282424912:role/bedrock-cicd-scanner
-  BEDROCK_MODEL_ARN: arn:aws:bedrock:us-east-1:232282424912:application-inference-profile/kaofehoxbka6
-  SCANNER_TAG: org-v2
+  # IT sets APPSEC_BEDROCK_MODEL_ARN to the approved Sonnet 5 application inference
+  # profile. Keep the known-good Opus profile as a fail-safe until that variable exists.
+  BEDROCK_MODEL_ARN: ${{ vars.APPSEC_BEDROCK_MODEL_ARN || 'arn:aws:bedrock:us-east-1:232282424912:application-inference-profile/kaofehoxbka6' }}
+  SCANNER_TAG: org-v3-cost-optimized
 
 jobs:
   deps:
     name: Dependency scan (OSV)
-    if: github.event.pull_request.draft == false
+    if: >-
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan')
     runs-on: ubuntu-latest
     steps:
+      - name: Debounce pushed commits
+        if: github.event.action == 'synchronize'
+        # A newer push cancels this run through the per-PR concurrency group.
+        run: sleep 600
+
       - uses: actions/checkout@v4
 
       - name: Run OSV-Scanner
@@ -52,6 +63,8 @@ jobs:
   ai-scan:
     name: AI security scan (phases 1-4)
     needs: deps
+    if: >-
+      github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan'
     runs-on: ubuntu-latest
     # Hard cap so a hung model call can never pin the check (and the PR) indefinitely.
     timeout-minutes: 25
@@ -64,7 +77,31 @@ jobs:
         with:
           name: osv-results
 
+      - name: Select scan policy
+        id: policy
+        env:
+          PR_ACTOR: ${{ github.actor }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          mode=full
+          reason=
+          if [ "$PR_ACTOR" = "vim-gitops-app[bot]" ]; then
+            changed_files="$(git diff --name-only "origin/$BASE_REF...HEAD")"
+            if [ -n "$changed_files" ] &&
+               ! printf '%s\n' "$changed_files" | grep -Ev '(^|/)dummy\.txt$' >/dev/null; then
+              mode=dependency-only
+              reason="verified GitOps trigger-only PR (all changed files are dummy.txt)"
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = dependency-only ]; then
+            echo "Generated-code bot '$PR_ACTOR': $reason; run OSV and deterministic reporting."
+          else
+            echo "Run full scan for '$PR_ACTOR'; bot identity alone never bypasses SAST."
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.policy.outputs.mode == 'full'
         with:
           role-to-assume: ${{ env.BEDROCK_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -83,8 +120,46 @@ jobs:
             echo '{"mcpServers":{"socket":{"type":"http","url":"https://mcp.socket.dev/"}}}' > .security-scan/mcp.json
           fi
 
+      - name: Record dependency-only scan
+        if: steps.policy.outputs.mode == 'dependency-only'
+        env:
+          PR_ACTOR: ${{ github.actor }}
+        run: |
+          jq --arg actor "$PR_ACTOR" '
+            {
+              scan_policy: "dependency-only",
+              policy_reason: ("Bedrock scan skipped for generated-code bot " + $actor),
+              phases_completed: ["deps"],
+              findings: [],
+              dependency_findings: [
+                .results[]?.packages[]?
+                | .package as $p
+                | (.vulnerabilities // []) as $v
+                | select(($v | length) > 0)
+                | {
+                    package: $p.name,
+                    version: $p.version,
+                    ecosystem: (($p.ecosystem // "unknown") | ascii_downcase),
+                    osv_ids: [$v[]?.id] | map(select(. != null)),
+                    reachable: null,
+                    action: (
+                      if any(
+                        $v[];
+                        ((.database_specific.severity // "") | ascii_upcase) == "CRITICAL"
+                        or ((.database_specific.severity // "") | ascii_upcase) == "HIGH"
+                      )
+                      then "BLOCK"
+                      else "WARN"
+                      end
+                    )
+                  }
+              ]
+            }
+          ' .security-scan/osv-results.json > .security-scan/findings.json
+
       # The scan prompt is shared between attempt 1 and the retry — kept in a file to stay DRY.
       - name: Write scan prompt
+        if: steps.policy.outputs.mode == 'full'
         env:
           REPO: ${{ github.repository }}
         run: |
@@ -137,7 +212,7 @@ jobs:
           into inline comments on each critical finding, and the "Security gate" step reads
           findings.json and decides whether to block. Your ONLY job is to write an accurate,
           complete findings.json — include `recommendation` on every finding, because that text is
-          what the developer sees as the remediation.
+          what the developer sees as the remediation in the Vim AppSec Agent PR comment.
           PROMPT
           sed -i "s|__REPO__|${REPO}|g" .security-scan/prompt.txt
           # Expose the prompt to both scan attempts as a multiline env var (DRY).
@@ -149,11 +224,11 @@ jobs:
 
       - name: Claude security scan (attempt 1)
         id: scan1
+        if: steps.policy.outputs.mode == 'full'
         continue-on-error: true
-        # Pinned to the last known-good release. The floating @v1 tag regressed in v1.0.175+:
-        # on Bedrock with a direct `prompt` the action no-ops after the trigger check (never
-        # installs/runs Claude Code, writes no findings.json), which fails the gate closed.
-        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
+        # Pin the reviewed release. Claude Code 2.1.293 supports the Sonnet 5 Bedrock
+        # profile; the older 2.1.210 runner stalled until the 25-minute job timeout.
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245 (Claude Code 2.1.293)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -164,9 +239,9 @@ jobs:
           # the workflow file to exist identically on the default branch)
           github_token: ${{ github.token }}
           use_bedrock: "true"
-          # Scan bot-authored PRs too (gitops/renovate/dependabot). Without this the action
-          # silently skips any bot-triggered run and writes no findings.json -> gate fails
-          # closed. Safe here: private repos + a fixed scan prompt the bot cannot control.
+          # Policy selection handles the one verified trigger-only GitOps shape. Keep the
+          # action enabled for every other bot (including the publish bot, Dependabot, and
+          # Renovate), otherwise it silently skips and the fail-closed gate sees no findings.json.
           allowed_bots: "*"
           claude_args: |
             --model ${{ env.BEDROCK_MODEL_ARN }}
@@ -174,16 +249,13 @@ jobs:
             --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git log:*),Bash(gh pr view:*),mcp__socket__depscore"
           prompt: ${{ env.SCAN_PROMPT }}
 
-      # Two no-op failure modes make the action exit in seconds without running Claude, writing
-      # no findings.json, which fails the gate closed:
-      #   1. DETERMINISTIC — a bot-authored trigger (gitops/renovate/dependabot). Fixed by
-      #      `allowed_bots: "*"` on every attempt above/below; retries alone never help this one.
-      #   2. TRANSIENT — an occasional runtime no-op. Back-to-back retries hit the same window,
-      #      so attempts 2 and 3 are spaced with a back-off to let it self-heal.
+      # A known no-op can return success without writing findings.json; retry only that
+      # shape with backoff. Explicit action failures fail closed immediately so denied,
+      # invalid, or misconfigured requests are never amplified.
       # The happy path (attempt 1 completes) skips all of this.
       - name: Check attempt 1 output
         id: check1
-        if: always()
+        if: always() && steps.policy.outputs.mode == 'full'
         run: |
           if jq -e '[("pr-review","architecture","taint") as $p | ([.phases_completed[]?] | index($p))] | all(. != null)' \
                .security-scan/findings.json >/dev/null 2>&1; then
@@ -192,16 +264,32 @@ jobs:
             echo "complete=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Classify attempt 1 failure
+        id: retry1
+        if: always() && steps.policy.outputs.mode == 'full' && steps.check1.outputs.complete != 'true'
+        env:
+          ATTEMPT_OUTCOME: ${{ steps.scan1.outcome }}
+        run: |
+          retryable=true
+          reason="successful action produced no complete output (known transient no-op)"
+          if [ "$ATTEMPT_OUTCOME" = "failure" ]; then
+            retryable=false
+            reason="action failed explicitly (do not amplify auth/model/invalid-request failures)"
+          fi
+          echo "retryable=$retryable" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "attempt 1: $reason; retryable=$retryable"
+
       - name: Back-off before attempt 2
-        if: steps.check1.outputs.complete != 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check1.outputs.complete != 'true' && steps.retry1.outputs.retryable == 'true'
         run: sleep 45
 
       - name: Claude security scan (attempt 2 — retry)
         id: scan2
-        if: steps.check1.outputs.complete != 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check1.outputs.complete != 'true' && steps.retry1.outputs.retryable == 'true'
         continue-on-error: true
-        # Pinned — see the note on attempt 1 above (floating @v1 regressed on Bedrock+prompt).
-        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
+        # Pinned — see the note on attempt 1 above.
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245 (Claude Code 2.1.293)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -219,7 +307,7 @@ jobs:
 
       - name: Check attempt 2 output
         id: check2
-        if: always()
+        if: always() && steps.policy.outputs.mode == 'full'
         run: |
           if jq -e '[("pr-review","architecture","taint") as $p | ([.phases_completed[]?] | index($p))] | all(. != null)' \
                .security-scan/findings.json >/dev/null 2>&1; then
@@ -228,16 +316,32 @@ jobs:
             echo "complete=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Classify attempt 2 failure
+        id: retry2
+        if: always() && steps.policy.outputs.mode == 'full' && steps.scan2.outcome != 'skipped' && steps.check2.outputs.complete != 'true'
+        env:
+          ATTEMPT_OUTCOME: ${{ steps.scan2.outcome }}
+        run: |
+          retryable=true
+          reason="successful action produced no complete output (known transient no-op)"
+          if [ "$ATTEMPT_OUTCOME" = "failure" ]; then
+            retryable=false
+            reason="action failed explicitly (do not amplify auth/model/invalid-request failures)"
+          fi
+          echo "retryable=$retryable" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "attempt 2: $reason; retryable=$retryable"
+
       - name: Back-off before attempt 3
-        if: steps.check2.outputs.complete != 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check2.outputs.complete != 'true' && steps.retry2.outputs.retryable == 'true'
         run: sleep 90
 
       - name: Claude security scan (attempt 3 — final retry)
         id: scan3
-        if: steps.check2.outputs.complete != 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check2.outputs.complete != 'true' && steps.retry2.outputs.retryable == 'true'
         continue-on-error: true
-        # Pinned — see the note on attempt 1 above (floating @v1 regressed on Bedrock+prompt).
-        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
+        # Pinned — see the note on attempt 1 above.
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245 (Claude Code 2.1.293)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -256,6 +360,8 @@ jobs:
       - name: Validate scan output
         id: validate
         if: always()
+        env:
+          SCAN_POLICY: ${{ steps.policy.outputs.mode }}
         run: |
           F=.security-scan/findings.json
           scan_ok=true; reason=""
@@ -263,6 +369,10 @@ jobs:
             scan_ok=false; reason="no findings.json written"
           elif ! jq -e . "$F" >/dev/null 2>&1; then
             scan_ok=false; reason="findings.json is not valid JSON"
+          elif [ "$SCAN_POLICY" = "dependency-only" ]; then
+            if ! jq -e '(.phases_completed // []) | index("deps") != null' "$F" >/dev/null 2>&1; then
+              scan_ok=false; reason="dependency-only scan did not complete deps phase"
+            fi
           else
             missing=$(jq -r '(["pr-review","architecture","taint"] - [.phases_completed[]?]) | join(", ")' "$F" 2>/dev/null || echo "all")
             if [ -n "$missing" ]; then scan_ok=false; reason="phases did not complete: ${missing}"; fi
@@ -295,9 +405,9 @@ jobs:
           set -uo pipefail
           F=.security-scan/findings.json
           M=.security-scan/summary.md
-          emoji() { case "$1" in
-            critical) printf '🔴';; high) printf '🟠';; medium) printf '🟡';;
-            low) printf '🔵';; info) printf '⚪';; *) printf '⚪';; esac; }
+          sev_heading() { case "$1" in
+            critical) printf 'Critical';; high) printf 'High';; medium) printf 'Medium';;
+            low) printf 'Low';; info) printf 'Info';; *) printf '%s' "$1";; esac; }
 
           crit=$(jq '[.findings[]?|select((.severity|ascii_downcase)=="critical")]|length' "$F")
           high=$(jq '[.findings[]?|select((.severity|ascii_downcase)=="high")]|length' "$F")
@@ -307,46 +417,97 @@ jobs:
           total=$(jq '[.findings[]?]|length' "$F")
           depblock=$(jq '[.dependency_findings[]?|select(.action=="BLOCK")]|length' "$F")
           depwarn=$(jq  '[.dependency_findings[]?|select(.action=="WARN")]|length' "$F")
+          scan_policy=$(jq -r '.scan_policy // "full"' "$F")
+          policy_reason=$(jq -r '.policy_reason // ""' "$F")
+
+          case "${BLOCK_ON_SEVERITY}" in
+            info) threshold=0 ;; low) threshold=1 ;; medium) threshold=2 ;;
+            high) threshold=3 ;; critical) threshold=4 ;; *) threshold=4 ;;
+          esac
+          blocking=$(jq --argjson t "$threshold" '
+            [ .findings[]? | (.severity|ascii_downcase) as $s
+              | ({info:0,low:1,medium:2,high:3,critical:4}[$s] // 0)
+              | select(. >= $t) ] | length' "$F")
+
+          if [ "${SCAN_OK}" != "true" ]; then
+            verdict="**Incomplete** — scan did not finish (${SCAN_REASON:-unknown}). Re-run the job; this is not a clean bill of health."
+          elif [ "${BLOCK_ON_SEVERITY}" != "none" ] && { [ "${blocking}" -gt 0 ] || [ "${depblock}" -gt 0 ]; }; then
+            verdict="**Blocked** — ${blocking} finding(s) at/above \`${BLOCK_ON_SEVERITY}\`"
+            [ "${depblock}" -gt 0 ] && verdict="${verdict}, ${depblock} dependency BLOCK(s)"
+            verdict="${verdict}."
+          elif [ "$scan_policy" = "dependency-only" ]; then
+            verdict="**Passed (dependency-only policy)** — OSV completed; Bedrock phases were intentionally skipped."
+          elif [ "$total" -eq 0 ] && [ "$depblock" -eq 0 ] && [ "$depwarn" -eq 0 ]; then
+            verdict="**Passed** — no findings introduced by this PR."
+          else
+            verdict="**Passed** — findings are below the gate (blocks at \`${BLOCK_ON_SEVERITY}\` or dependency BLOCK)."
+          fi
 
           {
             echo "<!-- security-scanner-results:v1 -->"
-            echo "## Security Scanner Results"
+            echo "## Vim AppSec Agent"
             echo
-            if [ "${SCAN_OK}" != "true" ]; then
-              echo "> ⚠️ **Scan did not complete** (${SCAN_REASON:-unknown}) — this is a scanner/infra issue, not a clean bill of health. Re-run the job."
+            echo "$verdict"
+            echo
+            echo "| Critical | High | Medium | Low | Info | Dep BLOCK | Dep WARN |"
+            echo "|:-:|:-:|:-:|:-:|:-:|:-:|:-:|"
+            echo "| **$crit** | **$high** | **$med** | **$low** | **$info** | **$depblock** | **$depwarn** |"
+            echo
+
+            if [ "$scan_policy" = "dependency-only" ]; then
+              echo "> **Scan policy:** ${policy_reason}"
               echo
             fi
-            echo "| Critical | High | Medium | Low | Info | Dep BLOCK | Dep WARN |"
-            echo "|---:|---:|---:|---:|---:|---:|---:|"
-            echo "| $crit | $high | $med | $low | $info | $depblock | $depwarn |"
-            echo
-            if [ "$total" -eq 0 ] && [ "$depblock" -eq 0 ] && [ "$depwarn" -eq 0 ]; then
-              echo "✅ No findings introduced by this PR."
-            else
+
+            if [ "$total" -gt 0 ]; then
               echo "### Findings"
               echo
-              jq -r '
-                def rank: {critical:4,high:3,medium:2,low:1,info:0}[(.severity|ascii_downcase)] // 0;
-                .findings // [] | sort_by(-rank) | .[]
-                | [ (.severity|ascii_downcase), .title,
-                    ((.file_path // "n/a") + (if .line_start then ":" + (.line_start|tostring) else "" end)),
-                    (.recommendation // "—") ] | @tsv
-              ' "$F" | while IFS=$'\t' read -r sev title loc rec; do
-                printf -- '- %s **%s** — `%s`\n' "$(emoji "$sev")" "$title" "$loc"
-                printf -- '  - _Remediation:_ %s\n' "$rec"
-              done
-              if [ "$depblock" -gt 0 ] || [ "$depwarn" -gt 0 ]; then
+              for sev in critical high medium low info; do
+                count=$(jq --arg s "$sev" '[.findings[]?|select((.severity|ascii_downcase)==$s)]|length' "$F")
+                [ "$count" -gt 0 ] || continue
+                echo "#### $(sev_heading "$sev") ($count)"
                 echo
-                echo "### Vulnerable dependencies"
-                jq -r '.dependency_findings // [] | map(select(.action=="BLOCK" or .action=="WARN")) | .[]
-                  | [ .action, (.package + "@" + (.version // "?")), ((.osv_ids // [])|join(", ")) ] | @tsv' "$F" \
-                  | while IFS=$'\t' read -r act pkg ids; do
-                      printf -- '- **%s** `%s` %s\n' "$act" "$pkg" "${ids:+($ids)}"
-                    done
-              fi
+                jq -r --arg s "$sev" '
+                  .findings // []
+                  | map(select((.severity|ascii_downcase)==$s))
+                  | .[]
+                  | [ (.title // "Untitled"),
+                      ((.file_path // "n/a") + (if .line_start then ":" + (.line_start|tostring) else "" end)),
+                      (.recommendation // "—"),
+                      (.cwe // "") ] | @tsv
+                ' "$F" | while IFS=$'\t' read -r title loc rec cwe; do
+                  printf -- '**%s**\n' "$title"
+                  printf -- '- **Where:** `%s`\n' "$loc"
+                  [ -n "$cwe" ] && printf -- '- **CWE:** %s\n' "$cwe"
+                  printf -- '- **Remediation:** %s\n' "$rec"
+                  echo
+                done
+              done
             fi
+
+            if [ "$depblock" -gt 0 ] || [ "$depwarn" -gt 0 ]; then
+              echo "### Dependencies"
+              echo
+              jq -r '.dependency_findings // [] | map(select(.action=="BLOCK" or .action=="WARN")) | .[]
+                | [ .action, (.package + "@" + (.version // "?")), ((.osv_ids // [])|join(", ")) ] | @tsv' "$F" \
+                | while IFS=$'\t' read -r act pkg ids; do
+                    printf -- '- **%s** `%s`' "$act" "$pkg"
+                    [ -n "${ids:-}" ] && printf ' — %s' "$ids"
+                    printf '\n'
+                  done
+              echo
+            fi
+
+            if [ "$scan_policy" = "full" ] && [ "$total" -eq 0 ] && [ "$depblock" -eq 0 ] && [ "$depwarn" -eq 0 ] && [ "${SCAN_OK}" = "true" ]; then
+              echo "_Nothing to remediate on this PR._"
+              echo
+            fi
+
+            echo "---"
             echo
-            echo "_Gate blocks at severity **${BLOCK_ON_SEVERITY}** or a dependency marked BLOCK. Full history in scanner-stats._"
+            echo "Gate blocks at severity **${BLOCK_ON_SEVERITY}** or a dependency marked **BLOCK**."
+            echo
+            echo "Questions, false positives, or feedback — ping **@abir-vim**."
           } > "$M"
 
           existing=$(gh api repos/"$REPO"/issues/"$PR_NUMBER"/comments --paginate \
@@ -388,12 +549,12 @@ jobs:
             if grep -qF "$marker" .security-scan/existing-inline.txt 2>/dev/null; then
               echo "inline exists, skip: $path:$line"; posted="$posted $idx"; continue
             fi
-            body=$(printf '🔴 **%s**\n\n_Remediation:_ %s\n%s' "$title" "$rec" "$marker")
+            body=$(printf '**Vim AppSec Agent** — critical\n\n**%s**\n\n**Remediation:** %s\n\nQuestions or false positives — ping @abir-vim.\n%s' "$title" "$rec" "$marker")
             if gh api repos/"$REPO"/pulls/"$PR_NUMBER"/comments \
                  -f body="$body" -f commit_id="$HEAD_SHA" -f path="$path" -F line="$line" -f side=RIGHT >/dev/null 2>&1; then
               echo "posted inline: $path:$line"; posted="$posted $idx"
             else
-              echo "::warning title=Inline comment::could not post inline comment for $path:$line (line may be outside the PR diff)"
+              echo "::warning title=Vim AppSec Agent::could not post inline comment for $path:$line (line may be outside the PR diff)"
             fi
           done < .security-scan/crit.tsv
 
@@ -430,7 +591,7 @@ jobs:
           # This is NOT a silent pass (closes the empty-findings false negative) and NOT a security
           # block — it tells the developer to re-run, and fails closed only after the in-run retry.
           if [ "${SCAN_OK}" != "true" ]; then
-            echo "::error title=Security Gate::Scan did not complete (${SCAN_REASON:-unknown}). This is a scanner/infra issue, not a security finding — re-run this job. Failing closed until a clean scan is recorded."
+            echo "::error title=Vim AppSec Agent::Scan did not complete (${SCAN_REASON:-unknown}). This is a scanner/infra issue, not a security finding — re-run this job. Failing closed until a clean scan is recorded."
             exit 1
           fi
 
@@ -444,20 +605,28 @@ jobs:
               | ({info:0,low:1,medium:2,high:3,critical:4}[$s] // 0)
               | select(. >= $t) ] | length' "$F")
           depblock=$(jq '[ .dependency_findings[]? | select(.action=="BLOCK") ] | length' "$F")
+          scan_policy=$(jq -r '.scan_policy // "full"' "$F")
 
           echo "Findings at or above '${BLOCK_ON_SEVERITY}': ${blocking}"
           echo "Dependency findings marked BLOCK: ${depblock}"
 
           if [ "${blocking}" -gt 0 ] || [ "${depblock}" -gt 0 ]; then
-            echo "::error title=Security Gate::BLOCKED — ${blocking} finding(s) at/above ${BLOCK_ON_SEVERITY} and ${depblock} dependency BLOCK(s). See the 'Security Scanner Results' PR comment for details."
+            echo "::error title=Vim AppSec Agent::BLOCKED — ${blocking} finding(s) at/above ${BLOCK_ON_SEVERITY} and ${depblock} dependency BLOCK(s). See the Vim AppSec Agent PR comment for details."
             exit 1
+          fi
+          if [ "$scan_policy" = "dependency-only" ]; then
+            echo "Security gate passed — explicit dependency-only policy completed; Bedrock was not invoked."
+            exit 0
           fi
           echo "Security gate passed — scan completed cleanly, no findings at or above '${BLOCK_ON_SEVERITY}'."
 
   report:
     name: Report to scanner-stats
     needs: [deps, ai-scan]
-    if: always() && github.event.pull_request.draft == false
+    if: >-
+      always() &&
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
