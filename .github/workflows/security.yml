@@ -8,9 +8,9 @@ name: Security
 
 on:
   pull_request:
-    # Cost control: scan once when review starts instead of after every pushed commit.
-    # Maintainers can add/re-add the `appsec-rescan` label to scan the latest head.
-    types: [opened, reopened, ready_for_review, labeled]
+    # Pushes are debounced before scanning so the required verdict still covers the
+    # latest head without paying for every commit in a burst.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 concurrency:
   group: security-scan-${{ github.event.pull_request.number }}
@@ -34,16 +34,16 @@ env:
 jobs:
   deps:
     name: Dependency scan (OSV)
-    # Generated deployment/publish PRs are high volume and are already validated by
-    # their source pipelines. Dependabot and Renovate remain eligible for scanning.
     if: >-
       github.event.pull_request.draft == false &&
-      (github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan') &&
-      github.actor != 'vim-gitops-app[bot]' &&
-      github.actor != 'vim-publish-bot[bot]' &&
-      github.actor != 'vim-tenant-config-validator[bot]'
+      (github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan')
     runs-on: ubuntu-latest
     steps:
+      - name: Debounce pushed commits
+        if: github.event.action == 'synchronize'
+        # A newer push cancels this run through the per-PR concurrency group.
+        run: sleep 600
+
       - uses: actions/checkout@v4
 
       - name: Run OSV-Scanner
@@ -63,6 +63,8 @@ jobs:
   ai-scan:
     name: AI security scan (phases 1-4)
     needs: deps
+    if: >-
+      github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan'
     runs-on: ubuntu-latest
     # Hard cap so a hung model call can never pin the check (and the PR) indefinitely.
     timeout-minutes: 25
@@ -75,7 +77,31 @@ jobs:
         with:
           name: osv-results
 
+      - name: Select scan policy
+        id: policy
+        env:
+          PR_ACTOR: ${{ github.actor }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          mode=full
+          reason=
+          if [ "$PR_ACTOR" = "vim-gitops-app[bot]" ]; then
+            changed_files="$(git diff --name-only "origin/$BASE_REF...HEAD")"
+            if [ -n "$changed_files" ] &&
+               ! printf '%s\n' "$changed_files" | grep -Ev '(^|/)dummy\.txt$' >/dev/null; then
+              mode=dependency-only
+              reason="verified GitOps trigger-only PR (all changed files are dummy.txt)"
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = dependency-only ]; then
+            echo "Generated-code bot '$PR_ACTOR': $reason; run OSV and deterministic reporting."
+          else
+            echo "Run full scan for '$PR_ACTOR'; bot identity alone never bypasses SAST."
+          fi
+
       - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.policy.outputs.mode == 'full'
         with:
           role-to-assume: ${{ env.BEDROCK_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -94,8 +120,46 @@ jobs:
             echo '{"mcpServers":{"socket":{"type":"http","url":"https://mcp.socket.dev/"}}}' > .security-scan/mcp.json
           fi
 
+      - name: Record dependency-only scan
+        if: steps.policy.outputs.mode == 'dependency-only'
+        env:
+          PR_ACTOR: ${{ github.actor }}
+        run: |
+          jq --arg actor "$PR_ACTOR" '
+            {
+              scan_policy: "dependency-only",
+              policy_reason: ("Bedrock scan skipped for generated-code bot " + $actor),
+              phases_completed: ["deps"],
+              findings: [],
+              dependency_findings: [
+                .results[]?.packages[]?
+                | .package as $p
+                | (.vulnerabilities // []) as $v
+                | select(($v | length) > 0)
+                | {
+                    package: $p.name,
+                    version: $p.version,
+                    ecosystem: (($p.ecosystem // "unknown") | ascii_downcase),
+                    osv_ids: [$v[]?.id] | map(select(. != null)),
+                    reachable: null,
+                    action: (
+                      if any(
+                        $v[];
+                        ((.database_specific.severity // "") | ascii_upcase) == "CRITICAL"
+                        or ((.database_specific.severity // "") | ascii_upcase) == "HIGH"
+                      )
+                      then "BLOCK"
+                      else "WARN"
+                      end
+                    )
+                  }
+              ]
+            }
+          ' .security-scan/osv-results.json > .security-scan/findings.json
+
       # The scan prompt is shared between attempt 1 and the retry — kept in a file to stay DRY.
       - name: Write scan prompt
+        if: steps.policy.outputs.mode == 'full'
         env:
           REPO: ${{ github.repository }}
         run: |
@@ -160,11 +224,11 @@ jobs:
 
       - name: Claude security scan (attempt 1)
         id: scan1
+        if: steps.policy.outputs.mode == 'full'
         continue-on-error: true
-        # Pinned to the last known-good release. The floating @v1 tag regressed in v1.0.175+:
-        # on Bedrock with a direct `prompt` the action no-ops after the trigger check (never
-        # installs/runs Claude Code, writes no findings.json), which fails the gate closed.
-        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
+        # Pin the reviewed release. Claude Code 2.1.293 supports the Sonnet 5 Bedrock
+        # profile; the older 2.1.210 runner stalled until the 25-minute job timeout.
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245 (Claude Code 2.1.293)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -175,9 +239,9 @@ jobs:
           # the workflow file to exist identically on the default branch)
           github_token: ${{ github.token }}
           use_bedrock: "true"
-          # The job-level filter excludes high-volume deployment/publish bots. Keep the
-          # action enabled for other bots (including Dependabot/Renovate), otherwise it
-          # silently skips and the fail-closed gate sees no findings.json.
+          # Policy selection handles the one verified trigger-only GitOps shape. Keep the
+          # action enabled for every other bot (including the publish bot, Dependabot, and
+          # Renovate), otherwise it silently skips and the fail-closed gate sees no findings.json.
           allowed_bots: "*"
           claude_args: |
             --model ${{ env.BEDROCK_MODEL_ARN }}
@@ -191,7 +255,7 @@ jobs:
       # The happy path (attempt 1 completes) skips all of this.
       - name: Check attempt 1 output
         id: check1
-        if: always()
+        if: always() && steps.policy.outputs.mode == 'full'
         run: |
           if jq -e '[("pr-review","architecture","taint") as $p | ([.phases_completed[]?] | index($p))] | all(. != null)' \
                .security-scan/findings.json >/dev/null 2>&1; then
@@ -202,7 +266,7 @@ jobs:
 
       - name: Classify attempt 1 failure
         id: retry1
-        if: always() && steps.check1.outputs.complete != 'true'
+        if: always() && steps.policy.outputs.mode == 'full' && steps.check1.outputs.complete != 'true'
         env:
           ATTEMPT_OUTCOME: ${{ steps.scan1.outcome }}
         run: |
@@ -217,15 +281,15 @@ jobs:
           echo "attempt 1: $reason; retryable=$retryable"
 
       - name: Back-off before attempt 2
-        if: steps.check1.outputs.complete != 'true' && steps.retry1.outputs.retryable == 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check1.outputs.complete != 'true' && steps.retry1.outputs.retryable == 'true'
         run: sleep 45
 
       - name: Claude security scan (attempt 2 — retry)
         id: scan2
-        if: steps.check1.outputs.complete != 'true' && steps.retry1.outputs.retryable == 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check1.outputs.complete != 'true' && steps.retry1.outputs.retryable == 'true'
         continue-on-error: true
-        # Pinned — see the note on attempt 1 above (floating @v1 regressed on Bedrock+prompt).
-        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
+        # Pinned — see the note on attempt 1 above.
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245 (Claude Code 2.1.293)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -243,7 +307,7 @@ jobs:
 
       - name: Check attempt 2 output
         id: check2
-        if: always()
+        if: always() && steps.policy.outputs.mode == 'full'
         run: |
           if jq -e '[("pr-review","architecture","taint") as $p | ([.phases_completed[]?] | index($p))] | all(. != null)' \
                .security-scan/findings.json >/dev/null 2>&1; then
@@ -254,7 +318,7 @@ jobs:
 
       - name: Classify attempt 2 failure
         id: retry2
-        if: always() && steps.scan2.outcome != 'skipped' && steps.check2.outputs.complete != 'true'
+        if: always() && steps.policy.outputs.mode == 'full' && steps.scan2.outcome != 'skipped' && steps.check2.outputs.complete != 'true'
         env:
           ATTEMPT_OUTCOME: ${{ steps.scan2.outcome }}
         run: |
@@ -269,15 +333,15 @@ jobs:
           echo "attempt 2: $reason; retryable=$retryable"
 
       - name: Back-off before attempt 3
-        if: steps.check2.outputs.complete != 'true' && steps.retry2.outputs.retryable == 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check2.outputs.complete != 'true' && steps.retry2.outputs.retryable == 'true'
         run: sleep 90
 
       - name: Claude security scan (attempt 3 — final retry)
         id: scan3
-        if: steps.check2.outputs.complete != 'true' && steps.retry2.outputs.retryable == 'true'
+        if: steps.policy.outputs.mode == 'full' && steps.check2.outputs.complete != 'true' && steps.retry2.outputs.retryable == 'true'
         continue-on-error: true
-        # Pinned — see the note on attempt 1 above (floating @v1 regressed on Bedrock+prompt).
-        uses: anthropics/claude-code-action@12531344451323133b0493233c759991ac61da12 # v1.0.174 (Claude Code 2.1.210)
+        # Pinned — see the note on attempt 1 above.
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245 (Claude Code 2.1.293)
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -296,6 +360,8 @@ jobs:
       - name: Validate scan output
         id: validate
         if: always()
+        env:
+          SCAN_POLICY: ${{ steps.policy.outputs.mode }}
         run: |
           F=.security-scan/findings.json
           scan_ok=true; reason=""
@@ -303,6 +369,10 @@ jobs:
             scan_ok=false; reason="no findings.json written"
           elif ! jq -e . "$F" >/dev/null 2>&1; then
             scan_ok=false; reason="findings.json is not valid JSON"
+          elif [ "$SCAN_POLICY" = "dependency-only" ]; then
+            if ! jq -e '(.phases_completed // []) | index("deps") != null' "$F" >/dev/null 2>&1; then
+              scan_ok=false; reason="dependency-only scan did not complete deps phase"
+            fi
           else
             missing=$(jq -r '(["pr-review","architecture","taint"] - [.phases_completed[]?]) | join(", ")' "$F" 2>/dev/null || echo "all")
             if [ -n "$missing" ]; then scan_ok=false; reason="phases did not complete: ${missing}"; fi
@@ -347,6 +417,8 @@ jobs:
           total=$(jq '[.findings[]?]|length' "$F")
           depblock=$(jq '[.dependency_findings[]?|select(.action=="BLOCK")]|length' "$F")
           depwarn=$(jq  '[.dependency_findings[]?|select(.action=="WARN")]|length' "$F")
+          scan_policy=$(jq -r '.scan_policy // "full"' "$F")
+          policy_reason=$(jq -r '.policy_reason // ""' "$F")
 
           case "${BLOCK_ON_SEVERITY}" in
             info) threshold=0 ;; low) threshold=1 ;; medium) threshold=2 ;;
@@ -363,6 +435,8 @@ jobs:
             verdict="**Blocked** — ${blocking} finding(s) at/above \`${BLOCK_ON_SEVERITY}\`"
             [ "${depblock}" -gt 0 ] && verdict="${verdict}, ${depblock} dependency BLOCK(s)"
             verdict="${verdict}."
+          elif [ "$scan_policy" = "dependency-only" ]; then
+            verdict="**Passed (dependency-only policy)** — OSV completed; Bedrock phases were intentionally skipped."
           elif [ "$total" -eq 0 ] && [ "$depblock" -eq 0 ] && [ "$depwarn" -eq 0 ]; then
             verdict="**Passed** — no findings introduced by this PR."
           else
@@ -379,6 +453,11 @@ jobs:
             echo "|:-:|:-:|:-:|:-:|:-:|:-:|:-:|"
             echo "| **$crit** | **$high** | **$med** | **$low** | **$info** | **$depblock** | **$depwarn** |"
             echo
+
+            if [ "$scan_policy" = "dependency-only" ]; then
+              echo "> **Scan policy:** ${policy_reason}"
+              echo
+            fi
 
             if [ "$total" -gt 0 ]; then
               echo "### Findings"
@@ -419,7 +498,7 @@ jobs:
               echo
             fi
 
-            if [ "$total" -eq 0 ] && [ "$depblock" -eq 0 ] && [ "$depwarn" -eq 0 ] && [ "${SCAN_OK}" = "true" ]; then
+            if [ "$scan_policy" = "full" ] && [ "$total" -eq 0 ] && [ "$depblock" -eq 0 ] && [ "$depwarn" -eq 0 ] && [ "${SCAN_OK}" = "true" ]; then
               echo "_Nothing to remediate on this PR._"
               echo
             fi
@@ -526,6 +605,7 @@ jobs:
               | ({info:0,low:1,medium:2,high:3,critical:4}[$s] // 0)
               | select(. >= $t) ] | length' "$F")
           depblock=$(jq '[ .dependency_findings[]? | select(.action=="BLOCK") ] | length' "$F")
+          scan_policy=$(jq -r '.scan_policy // "full"' "$F")
 
           echo "Findings at or above '${BLOCK_ON_SEVERITY}': ${blocking}"
           echo "Dependency findings marked BLOCK: ${depblock}"
@@ -533,6 +613,10 @@ jobs:
           if [ "${blocking}" -gt 0 ] || [ "${depblock}" -gt 0 ]; then
             echo "::error title=Vim AppSec Agent::BLOCKED — ${blocking} finding(s) at/above ${BLOCK_ON_SEVERITY} and ${depblock} dependency BLOCK(s). See the Vim AppSec Agent PR comment for details."
             exit 1
+          fi
+          if [ "$scan_policy" = "dependency-only" ]; then
+            echo "Security gate passed — explicit dependency-only policy completed; Bedrock was not invoked."
+            exit 0
           fi
           echo "Security gate passed — scan completed cleanly, no findings at or above '${BLOCK_ON_SEVERITY}'."
 
@@ -542,10 +626,7 @@ jobs:
     if: >-
       always() &&
       github.event.pull_request.draft == false &&
-      (github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan') &&
-      github.actor != 'vim-gitops-app[bot]' &&
-      github.actor != 'vim-publish-bot[bot]' &&
-      github.actor != 'vim-tenant-config-validator[bot]'
+      (github.event.action != 'labeled' || github.event.label.name == 'appsec-rescan')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
